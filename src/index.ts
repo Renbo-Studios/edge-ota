@@ -435,7 +435,8 @@ program
         platform,
         bundleHash,
         timestamp:      Date.now(),
-        assetCount:     assets.length
+        assetCount:     assets.length,
+        publicKey:      config.publicKey
       };
       const payloadStr = JSON.stringify(payloadObj);
 
