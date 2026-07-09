@@ -1,17 +1,19 @@
 /**
  * EdgeOTA Core - Expo Updates Protocol v1 Manifest Engine
  *
- * Implements the exact wire format consumed by expo-updates SDK:
+ * Implements the exact wire format consumed by expo-updates SDK,
+ * matching the official expo/custom-expo-updates-server reference:
  * - EAS Update-compatible manifest structure
- * - Multipart/mixed response body with proper boundary
+ * - Multipart/mixed response body with FormData-compatible boundary
  * - expo-signature header for ECDSA bundle verification
- * - Structured extension (extra) metadata passthrough
+ * - fileExtension on launchAsset and assets
+ * - extra.expoClient config passthrough
  */
 
 export interface ExpoAsset {
-  hash: string;       // SHA-256 hex of the asset bytes
-  key: string;        // Unique key within the bundle (e.g. "bundle", "assets/icon")
-  fileExtension?: string;
+  hash: string;       // SHA-256 base64url of the asset bytes
+  key: string;        // MD5 hex of the asset content (used as filename on device)
+  fileExtension: string; // e.g. ".bundle", ".png", ".ttf" — REQUIRED by expo-updates
   contentType: string;
   url: string;        // Absolute URL the client will fetch from
 }
@@ -40,15 +42,17 @@ export interface ManifestParams {
   bundleUrl: string;
   /** SHA-256 hex digest of the raw bundle bytes */
   bundleHash: string;
+  /** MD5 hex of the bundle bytes — used as the `key` field (device filename) */
+  bundleKey?: string;
   assets: ExpoAsset[];
   metadata?: Record<string, unknown>;
   extra?: Record<string, unknown>;
 }
 
 /**
- * Build the Expo Updates v1 manifest object.
- * The client SDK deserialises this from the `manifest` part of the
- * multipart response (or directly from the response body in non-multipart mode).
+ * Convert a hex SHA-256 hash to base64url encoding.
+ * expo-updates verifies downloaded assets by computing SHA-256, base64url-encoding it,
+ * and comparing against the manifest `hash` field.
  */
 function hexToBase64Url(hex: string): string {
   if (hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex)) {
@@ -69,6 +73,10 @@ function hexToBase64Url(hex: string): string {
     .replace(/=+$/, '');
 }
 
+/**
+ * Build the Expo Updates v1 manifest object.
+ * Matches the format produced by expo/custom-expo-updates-server.
+ */
 export function generateExpoManifest(params: ManifestParams): ExpoManifest {
   return {
     id: params.updateId,
@@ -76,7 +84,8 @@ export function generateExpoManifest(params: ManifestParams): ExpoManifest {
     runtimeVersion: params.runtimeVersion,
     launchAsset: {
       hash: hexToBase64Url(params.bundleHash),
-      key: "bundle",
+      key: params.bundleKey || params.bundleHash.slice(0, 32),
+      fileExtension: ".bundle",
       contentType: "application/javascript",
       url: params.bundleUrl
     },
@@ -96,19 +105,15 @@ export function generateExpoManifest(params: ManifestParams): ExpoManifest {
  * expo-sfv-version: "0"       — Structured Fields version
  * cache-control               — Updates must never be stale; client always revalidates
  * expo-signature              — ECDSA P-256 + SHA-256 signature over the manifest JSON
- *                               (base64url-encoded DER). Omitted when no key is configured.
  */
 export function createExpoHeaders(signature?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "expo-protocol-version": "1",
     "expo-sfv-version": "0",
-    "cache-control": "private, max-age=0, must-revalidate",
-    "content-type": "application/json"
+    "cache-control": "private, max-age=0",
   };
 
   if (signature) {
-    // EAS format: sig="<base64>", keyid="root", alg="sig-rs256"
-    // For ECDSA P-256 we use the simpler bare signature header
     headers["expo-signature"] = `sig="${signature}", keyid="root", alg="ecdsa-p256-sha256"`;
   }
 
@@ -116,35 +121,41 @@ export function createExpoHeaders(signature?: string): Record<string, string> {
 }
 
 /**
- * Build the multipart/mixed response body required when the client sends
- * `Accept: multipart/mixed` (expo-updates >=0.18).
+ * Build the multipart/mixed response body required by expo-updates protocol v1.
+ * Uses FormData-compatible boundary formatting matching the official Expo server.
  *
- * Layout:
- *   --<boundary>
- *   Content-Type: application/json
- *   expo-signature: sig="...", keyid="root", alg="ecdsa-p256-sha256"
- *
- *   <manifest JSON>
- *   --<boundary>--
+ * The expo-updates native client parses this multipart body to extract the manifest
+ * from the part named "manifest".
  */
 export function buildMultipartManifestBody(
   manifest: ExpoManifest,
   signature?: string
-): { body: string; boundary: string } {
-  const boundary = "expo-update-boundary-" + Math.random().toString(36).slice(2, 10);
+): { body: string; boundary: string; contentType: string } {
+  const boundary = "ota" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const manifestJson = JSON.stringify(manifest);
 
-  let partHeaders = "Content-Disposition: inline; name=\"manifest\"\r\n";
-  partHeaders += "Content-Type: application/json\r\n";
+  // Build the manifest part headers exactly as FormData would
+  let manifestPart = `--${boundary}\r\n`;
+  manifestPart += `Content-Disposition: form-data; name="manifest"\r\n`;
+  manifestPart += `Content-Type: application/json; charset=utf-8\r\n`;
   if (signature) {
-    partHeaders += `expo-signature: sig="${signature}", keyid="root", alg="ecdsa-p256-sha256"\r\n`;
+    manifestPart += `expo-signature: sig="${signature}", keyid="root", alg="ecdsa-p256-sha256"\r\n`;
   }
+  manifestPart += `\r\n`;
+  manifestPart += manifestJson;
+  manifestPart += `\r\n`;
 
-  const body =
-    `--${boundary}\r\n` +
-    `${partHeaders}\r\n` +
-    `${manifestJson}\r\n` +
-    `--${boundary}--\r\n`;
+  // Build the extensions part (included by official Expo server)
+  const extensions = { assetRequestHeaders: {} };
+  let extensionsPart = `--${boundary}\r\n`;
+  extensionsPart += `Content-Disposition: form-data; name="extensions"\r\n`;
+  extensionsPart += `Content-Type: application/json\r\n`;
+  extensionsPart += `\r\n`;
+  extensionsPart += JSON.stringify(extensions);
+  extensionsPart += `\r\n`;
 
-  return { body, boundary };
+  const body = manifestPart + extensionsPart + `--${boundary}--\r\n`;
+
+  return { body, boundary, contentType: `multipart/mixed; boundary=${boundary}` };
 }
+

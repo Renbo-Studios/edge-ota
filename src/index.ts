@@ -1,192 +1,407 @@
 #!/usr/bin/env node
 
 /**
- * edge-ota CLI
+ * edge-ota CLI  — Zero-SDK, self-hostable OTA updates for Expo
+ * by Renbo Studios  —  Mobile App Development Studio
+ * https://renbostudios.com
  *
- * Phase 1: Build / Upload
- * ─────────────────────────────────────────────────────────────────────────
- * 1. `edge-ota init`   – Generate ECDSA P-256 key pair, write config + private key.
- * 2. `edge-ota push`   – Run `expo export`, collect JS bundle + assets, compute
- *                        per-asset SHA-256 hashes, sign the upload payload with the
- *                        private key, POST a multipart/form-data to /api/updates.
- * 3. `edge-ota status` – List recent releases and their channel assignments.
- *
- * The server verifies the ECDSA signature before accepting the bundle,
- * then stores assets on disk (server-node) or R2 (worker-oss) and
- * records the update in the database.
- *
- * From that point the Expo Updates SDK handshake is:
- *   GET /api/updates
- *   expo-platform: ios | android
- *   expo-runtime-version: <semver>
- *   expo-channel-name: production | staging | …
- *
- * The server responds with an Expo Updates v1 manifest JSON (signed if a
- * public key is configured) and the SDK fetches launchAsset.url to swap
- * the active bundle.
+ * Commands:
+ *   edge-ota login    — Authenticate and save credentials globally
+ *   edge-ota logout   — Remove stored credentials
+ *   edge-ota init     — Register project, generate signing keys, configure app.json
+ *   edge-ota push     — Export bundle and publish an OTA update
+ *   edge-ota status   — List recent deployments for this project
+ *   edge-ota keygen   — Generate a new ECDSA key pair (prints to stdout)
  */
 
 import { Command } from "commander";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
-import { createWriteStream } from "fs";
-import archiver from "archiver";
 import readline from "readline";
+import { fileURLToPath } from "url";
 import {
   generateECDSAKeyPair,
   signPayload,
   sha256Hex
 } from "./core/index.js";
 
-// ─── Auto-load .env from the project root ────────────────────────────────────
-// Lets users store EDGE_OTA_TOKEN in a .env file without shell exports.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ─── Global Config Paths ─────────────────────────────────────────────────────
+
+const GLOBAL_CONFIG_DIR  = path.join(os.homedir(), ".config", "edge-ota");
+const GLOBAL_CONFIG_FILE = path.join(GLOBAL_CONFIG_DIR, "config.json");
+const GLOBAL_KEYS_DIR    = path.join(GLOBAL_CONFIG_DIR, "keys");
+
+interface GlobalConfig {
+  token:     string;
+  email:     string;
+  serverUrl: string;
+}
+
+function loadGlobalConfig(): GlobalConfig | null {
+  try {
+    if (fs.existsSync(GLOBAL_CONFIG_FILE)) {
+      return JSON.parse(fs.readFileSync(GLOBAL_CONFIG_FILE, "utf-8")) as GlobalConfig;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveGlobalConfig(config: GlobalConfig): void {
+  fs.mkdirSync(GLOBAL_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(GLOBAL_CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+function clearGlobalConfig(): void {
+  try { fs.rmSync(GLOBAL_CONFIG_FILE); } catch { /* ignore */ }
+}
+
+function loadPrivateKey(projectId: string): string | null {
+  // 1. Global key store (new location)
+  const globalKeyPath = path.join(GLOBAL_KEYS_DIR, `${projectId}.key`);
+  if (fs.existsSync(globalKeyPath)) {
+    return fs.readFileSync(globalKeyPath, "utf-8").trim();
+  }
+  // 2. Legacy local file (backward compat with deprecation notice)
+  const localKeyPath = path.resolve(process.cwd(), ".edge-ota.private.key");
+  if (fs.existsSync(localKeyPath)) {
+    spin.stop();
+    console.log(`  ${c.yellow}⚠${c.reset}  Using legacy ${c.dim}.edge-ota.private.key${c.reset} in project directory.`);
+    console.log(`     Move it to ${c.dim}${globalKeyPath}${c.reset} and delete the local copy.`);
+    return fs.readFileSync(localKeyPath, "utf-8").trim();
+  }
+  return null;
+}
+
+function savePrivateKey(projectId: string, key: string): void {
+  fs.mkdirSync(GLOBAL_KEYS_DIR, { recursive: true });
+  const keyPath = path.join(GLOBAL_KEYS_DIR, `${projectId}.key`);
+  fs.writeFileSync(keyPath, key, { mode: 0o600 });
+}
+
+// ─── Auto-load .env ───────────────────────────────────────────────────────────
+
 try {
   const envPath = path.resolve(process.cwd(), ".env");
   if (fs.existsSync(envPath)) {
-    const lines = fs.readFileSync(envPath, "utf8").split("\n");
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-      if (!(key in process.env)) process.env[key] = val;
+    for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq === -1) continue;
+      const k = t.slice(0, eq).trim();
+      const v = t.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+      if (!(k in process.env)) process.env[k] = v;
     }
   }
-} catch { /* silently skip if .env is unreadable */ }
+} catch { /* silently skip */ }
 
-// ─── ANSI Styling Helpers ───────────────────────────────────────────────────
+// ─── ANSI Colors ─────────────────────────────────────────────────────────────
 
-const colors = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
+const c = {
+  reset:     "\x1b[0m",
+  bold:      "\x1b[1m",
+  dim:       "\x1b[2m",
   underline: "\x1b[4m",
-  
-  // Foreground Colors
-  black: "\x1b[30m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-  cyan: "\x1b[36m",
-  white: "\x1b[37m",
-  gray: "\x1b[90m",
+  red:       "\x1b[31m",
+  green:     "\x1b[32m",
+  yellow:    "\x1b[33m",
+  blue:      "\x1b[34m",
+  cyan:      "\x1b[36m",
+  white:     "\x1b[37m",
+  gray:      "\x1b[90m",
 };
 
+// ─── Spinner ─────────────────────────────────────────────────────────────────
+
+const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const spin = (() => {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let frame = 0;
+  let label = "";
+
+  return {
+    start(text: string) {
+      label = text;
+      frame = 0;
+      if (!process.stdout.isTTY) {
+        process.stdout.write(`  ${text}...\n`);
+        return;
+      }
+      timer = setInterval(() => {
+        const f = `${c.cyan}${FRAMES[frame % FRAMES.length]}${c.reset}`;
+        process.stdout.write(`\r  ${f}  ${c.dim}${label}${c.reset}   `);
+        frame++;
+      }, 80);
+    },
+    update(text: string) {
+      label = text;
+    },
+    stop(successMsg?: string) {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (process.stdout.isTTY) {
+        process.stdout.write("\r\x1b[K"); // clear line
+      }
+      if (successMsg) {
+        console.log(`  ${c.green}✓${c.reset}  ${successMsg}`);
+      }
+    },
+    fail(errMsg: string) {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (process.stdout.isTTY) process.stdout.write("\r\x1b[K");
+      console.error(`  ${c.red}✗${c.reset}  ${errMsg}`);
+    }
+  };
+})();
+
+// ─── Package version ─────────────────────────────────────────────────────────
+
+let packageVersion = "0.2.9";
+try {
+  const pkgPath = path.join(__dirname, "..", "package.json");
+  if (fs.existsSync(pkgPath)) {
+    packageVersion = JSON.parse(fs.readFileSync(pkgPath, "utf8")).version;
+  }
+} catch { /* fallback */ }
+
+// ─── Banner ───────────────────────────────────────────────────────────────────
+
 function printBanner() {
-  const line = `${colors.dim}${"-".repeat(48)}${colors.reset}`;
-  console.log(`\n${line}`);
-  console.log(`  ${colors.bold}${colors.white}edge-ota${colors.reset}  ${colors.dim}v0.2.4 · Zero-SDK OTA for Expo${colors.reset}`);
-  console.log(`  ${colors.dim}by Renbo Studios · renbostudios.com${colors.reset}`);
-  console.log(`${line}\n`);
+  const sep = `${c.dim}${"─".repeat(52)}${c.reset}`;
+  console.log(`\n${sep}`);
+  console.log(`  ${c.bold}${c.white}edge-ota${c.reset}  ${c.dim}v${packageVersion} · Zero-SDK OTA for Expo${c.reset}`);
+  console.log(`  ${c.dim}by ${c.reset}${c.bold}Renbo Studios${c.reset}${c.dim} — Mobile App Development Studio${c.reset}`);
+  console.log(`  ${c.dim}renbostudios.com${c.reset}`);
+  console.log(`${sep}\n`);
 }
 
-// ─── Config helpers ──────────────────────────────────────────────────────────
+// ─── app.json helpers ────────────────────────────────────────────────────────
 
-interface EdgeOTAConfig {
-  serverUrl: string;
-  projectId?: string;
-  publicKey: string;
+interface AppJsonConfig {
+  serverUrl:      string;
+  projectId:      string | null;
+  runtimeVersion: string;
+  publicKey?:     string;
 }
 
-function askQuestion(query: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-  return new Promise((resolve) => {
-    rl.question(query, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
-}
-
-function updateAppJson(cwd: string, serverUrl: string, projectId?: string) {
+function readAppJson(cwd: string): AppJsonConfig {
   const appJsonPath = path.resolve(cwd, "app.json");
   if (!fs.existsSync(appJsonPath)) {
-    console.log("⚠️   app.json not found in this directory. Skipping auto-update.");
-    return;
+    console.error(`\n  ${c.red}✗${c.reset}  ${c.bold}app.json not found${c.reset} in ${cwd}`);
+    console.error(`     Run this command from your Expo project root.\n`);
+    process.exit(1);
   }
 
+  let data: any;
   try {
-    const raw = fs.readFileSync(appJsonPath, "utf-8");
-    const data = JSON.parse(raw);
+    data = JSON.parse(fs.readFileSync(appJsonPath, "utf-8"));
+  } catch {
+    console.error(`  ${c.red}✗${c.reset}  Failed to parse app.json`);
+    process.exit(1);
+  }
 
+  const expo = data?.expo ?? {};
+
+  // ── Runtime version ──
+  const runtimeVersion = expo.runtimeVersion;
+  if (!runtimeVersion) {
+    console.error(`  ${c.red}✗${c.reset}  ${c.bold}expo.runtimeVersion${c.reset} is not set in app.json`);
+    console.error(`     Add: ${c.dim}"runtimeVersion": "1.0.0"${c.reset} under the expo key.\n`);
+    process.exit(1);
+  }
+
+  // ── Updates URL ──
+  const updatesUrl: string = expo?.updates?.url ?? "";
+  if (!updatesUrl) {
+    console.error(`  ${c.red}✗${c.reset}  ${c.bold}expo.updates.url${c.reset} is not configured in app.json`);
+    console.error(`     Run ${c.cyan}edge-ota init${c.reset} to set this up.\n`);
+    process.exit(1);
+  }
+
+  // Parse serverUrl and projectId from the updates URL
+  // Expected format: https://<host>/api/projects/<uuid>/updates
+  //              or: https://<host>/api/updates
+  let serverUrl: string;
+  let projectId: string | null = null;
+
+  try {
+    const u = new URL(updatesUrl);
+    const projectMatch = u.pathname.match(/\/api\/projects\/([^/]+)\/updates/);
+    if (projectMatch) {
+      projectId = projectMatch[1];
+      serverUrl = `${u.protocol}//${u.host}`;
+    } else {
+      serverUrl = `${u.protocol}//${u.host}`;
+    }
+  } catch {
+    console.error(`  ${c.red}✗${c.reset}  Could not parse ${c.dim}expo.updates.url${c.reset} in app.json`);
+    process.exit(1);
+  }
+
+  return { serverUrl, projectId, runtimeVersion, publicKey: expo.updates?.publicKey };
+}
+
+function updateAppJson(cwd: string, serverUrl: string, projectId?: string, publicKey?: string) {
+  const appJsonPath = path.resolve(cwd, "app.json");
+  if (!fs.existsSync(appJsonPath)) return;
+
+  try {
+    const data = JSON.parse(fs.readFileSync(appJsonPath, "utf-8"));
     if (!data.expo) data.expo = {};
     if (!data.expo.updates) data.expo.updates = {};
 
-    const updateUrl = projectId
-      ? `${serverUrl.replace(/\/$/, "")}/api/projects/${projectId}/updates`
-      : `${serverUrl.replace(/\/$/, "")}/api/updates`;
-    data.expo.updates.url = updateUrl;
+    const cleanUrl = serverUrl.replace(/\/$/, "");
+    data.expo.updates.url = projectId
+      ? `${cleanUrl}/api/projects/${projectId}/updates`
+      : `${cleanUrl}/api/updates`;
+    data.expo.updates.checkAutomatically = data.expo.updates.checkAutomatically ?? "ON_LOAD";
+    data.expo.updates.fallbackToCacheTimeout = data.expo.updates.fallbackToCacheTimeout ?? 30000;
+    data.expo.updates.requestHeaders = data.expo.updates.requestHeaders ?? { "expo-channel-name": "production" };
 
-    fs.writeFileSync(appJsonPath, JSON.stringify(data, null, 2), "utf-8");
-    console.log(`  ${colors.dim}app.json${colors.reset}  updates.url set`);
-  } catch (error: any) {
-    console.error(`  ${colors.red}error${colors.reset}  Failed to update app.json: ${error.message}`);
+    if (publicKey) {
+      data.expo.updates.codeSigningCertificate = undefined; // clear legacy
+      data.expo.extra = data.expo.extra ?? {};
+      data.expo.extra.edgeOtaPublicKey = publicKey;
+    }
+
+    fs.writeFileSync(appJsonPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    console.log(`  ${c.dim}app.json${c.reset}    updated ${c.dim}expo.updates.url${c.reset}`);
+  } catch (e: any) {
+    console.error(`  ${c.yellow}⚠${c.reset}   Could not update app.json: ${e.message}`);
   }
 }
 
-function loadConfig(cwd: string): EdgeOTAConfig {
-  const configPath = path.resolve(cwd, "edge-ota.config.json");
-  if (!fs.existsSync(configPath)) {
-    console.error(
-      "❌  edge-ota.config.json not found. Run `edge-ota init` first."
-    );
-    process.exit(1);
-  }
-  return JSON.parse(fs.readFileSync(configPath, "utf-8")) as EdgeOTAConfig;
+// ─── Readline helper ─────────────────────────────────────────────────────────
+
+function ask(query: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(query, a => { rl.close(); resolve(a.trim()); }));
 }
 
-function loadPrivateKey(cwd: string): string {
-  const keyPath = path.resolve(cwd, ".edge-ota.private.key");
-  if (!fs.existsSync(keyPath)) {
-    console.error(
-      "❌  .edge-ota.private.key not found. Run `edge-ota init` first."
-    );
-    process.exit(1);
-  }
-  return fs.readFileSync(keyPath, "utf-8");
-}
-
-// ─── Archive helper ──────────────────────────────────────────────────────────
-
-function zipDirectory(sourceDir: string, outPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const archive = archiver("zip", { zlib: { level: 9 } });
-    const stream  = createWriteStream(outPath);
-    archive.directory(sourceDir, false);
-    archive.on("error", reject);
-    stream.on("close", resolve);
-    archive.pipe(stream);
-    archive.finalize();
+function askSecret(query: string): Promise<string> {
+  return new Promise(resolve => {
+    if (process.stdin.isTTY) {
+      process.stdout.write(query);
+      let input = "";
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", function onData(ch: string) {
+        if (ch === "\r" || ch === "\n") {
+          process.stdin.setRawMode(false);
+          process.stdin.removeListener("data", onData);
+          process.stdout.write("\n");
+          resolve(input);
+        } else if (ch === "\u0003") {
+          process.exit(0);
+        } else if (ch === "\u007f") {
+          if (input.length > 0) { input = input.slice(0, -1); process.stdout.write("\b \b"); }
+        } else {
+          input += ch;
+          process.stdout.write("•");
+        }
+      });
+    } else {
+      ask(query).then(resolve);
+    }
   });
 }
 
-// ─── SHA-256 of a file ───────────────────────────────────────────────────────
-
-async function hashFile(filePath: string): Promise<string> {
-  const buffer = fs.readFileSync(filePath);
-  return sha256Hex(buffer.buffer.slice(
-    buffer.byteOffset,
-    buffer.byteOffset + buffer.byteLength
-  ) as ArrayBuffer);
+interface SelectOptionItem<T> {
+  label: string;
+  value: T;
 }
 
-// ─── Collect Expo export assets ──────────────────────────────────────────────
+function selectOption<T>(
+  question: string,
+  options: SelectOptionItem<T>[]
+): Promise<T> {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      console.log(`  ${c.bold}${question}${c.reset}`);
+      options.forEach((opt, idx) => {
+        console.log(`  [${idx + 1}] ${opt.label}`);
+      });
+      ask(`  selection (1-${options.length}): `).then((choice) => {
+        const idx = parseInt(choice) - 1;
+        if (!isNaN(idx) && idx >= 0 && idx < options.length) {
+          resolve(options[idx].value);
+        } else {
+          resolve(options[0].value);
+        }
+      });
+      return;
+    }
+
+    let cursor = 0;
+    const hideCursor = "\u001b[?25l";
+    const showCursor = "\u001b[?25h";
+    let hasRendered = false;
+
+    console.log(`  ${c.bold}${question}${c.reset}`);
+
+    function render() {
+      if (hasRendered) {
+        for (let i = 0; i < options.length; i++) {
+          process.stdout.write("\r\u001b[K\u001b[A");
+        }
+        process.stdout.write("\r\u001b[K");
+      }
+      hasRendered = true;
+
+      options.forEach((opt, idx) => {
+        const isSelected = idx === cursor;
+        const marker = isSelected ? `${c.cyan}❯${c.reset}` : " ";
+        const text = isSelected ? `${c.bold}${c.cyan}${opt.label}${c.reset}` : `${c.dim}${opt.label}${c.reset}`;
+        process.stdout.write(`  ${marker} ${text}\n`);
+      });
+    }
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdout.write(hideCursor);
+    render();
+
+    function onKeypress(str: string, key: any) {
+      if (key.ctrl && key.name === "c") {
+        process.stdout.write(showCursor);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.exit(0);
+      }
+
+      if (key.name === "up" || key.name === "k") {
+        cursor = (cursor - 1 + options.length) % options.length;
+        render();
+      } else if (key.name === "down" || key.name === "j") {
+        cursor = (cursor + 1) % options.length;
+        render();
+      } else if (key.name === "return" || key.name === "enter") {
+        process.stdout.write(showCursor);
+        process.stdin.setRawMode(false);
+        process.stdin.removeListener("keypress", onKeypress);
+        process.stdin.pause();
+        resolve(options[cursor].value);
+      }
+    }
+
+    process.stdin.on("keypress", onKeypress);
+  });
+}
+
+// ─── Asset collection ─────────────────────────────────────────────────────────
 
 interface AssetEntry {
-  /** Path on disk */
-  localPath: string;
-  /** Key used in the manifest (relative to the dist dir) */
-  key: string;
+  localPath:   string;
+  key:         string;
   contentType: string;
-  hash: string;
+  hash:        string;
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -203,8 +418,16 @@ const CONTENT_TYPES: Record<string, string> = {
   ".woff":  "font/woff",
   ".woff2": "font/woff2",
   ".mp4":   "video/mp4",
-  ".webm":  "video/webm"
+  ".webm":  "video/webm",
 };
+
+async function hashFile(filePath: string): Promise<string> {
+  const buffer = fs.readFileSync(filePath);
+  return sha256Hex(buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength
+  ) as ArrayBuffer);
+}
 
 async function collectAssets(distDir: string): Promise<AssetEntry[]> {
   const entries: AssetEntry[] = [];
@@ -212,237 +435,430 @@ async function collectAssets(distDir: string): Promise<AssetEntry[]> {
   function walk(dir: string) {
     for (const name of fs.readdirSync(dir)) {
       const full = path.join(dir, name);
-      const stat = fs.statSync(full);
-      if (stat.isDirectory()) {
+      if (fs.statSync(full).isDirectory()) {
         walk(full);
       } else {
-        const ext  = path.extname(name).toLowerCase();
-        const ct   = CONTENT_TYPES[ext] || "application/octet-stream";
-        const key  = path.relative(distDir, full).replace(/\\/g, "/");
-        entries.push({ localPath: full, key, contentType: ct, hash: "" });
+        const ext = path.extname(name).toLowerCase();
+        entries.push({
+          localPath:   full,
+          key:         path.relative(distDir, full).replace(/\\/g, "/"),
+          contentType: CONTENT_TYPES[ext] || "application/octet-stream",
+          hash:        ""
+        });
       }
     }
   }
 
   walk(distDir);
-
-  // Hash all assets in parallel
-  await Promise.all(
-    entries.map(async (e) => {
-      e.hash = await hashFile(e.localPath);
-    })
-  );
-
+  await Promise.all(entries.map(async e => { e.hash = await hashFile(e.localPath); }));
   return entries;
 }
 
-// ─── Detect the JS bundle within the Expo export output ──────────────────────
-
 function findBundle(distDir: string, platform: string): string | null {
-  // Expo SDK 50+ writes: dist/_expo/static/js/<platform>/<hash>.js (or .hbc)
   const expoStaticJs = path.join(distDir, "_expo", "static", "js", platform);
   if (fs.existsSync(expoStaticJs)) {
     const files = fs.readdirSync(expoStaticJs).filter(f => f.endsWith(".js") || f.endsWith(".hbc"));
     if (files.length) return path.join(expoStaticJs, files[0]);
   }
-
-  // Fallback: older SDK flat layout
   const flatJs = path.join(distDir, `index.${platform}.js`);
   if (fs.existsSync(flatJs)) return flatJs;
   const flatHbc = path.join(distDir, `index.${platform}.hbc`);
   if (fs.existsSync(flatHbc)) return flatHbc;
-
-  // Any .js or .hbc at root
   const rootJs = fs.readdirSync(distDir).find(f => f.endsWith(".js") || f.endsWith(".hbc"));
   if (rootJs) return path.join(distDir, rootJs);
-
   return null;
 }
 
-// ─── CLI definition ──────────────────────────────────────────────────────────
+// ─── Auth token resolution ────────────────────────────────────────────────────
+
+function resolveToken(): string | null {
+  // 1. Global config
+  const cfg = loadGlobalConfig();
+  if (cfg?.token) return cfg.token;
+  // 2. Env var fallback
+  return process.env.EDGE_OTA_TOKEN || null;
+}
+
+// ─── Program ─────────────────────────────────────────────────────────────────
 
 const program = new Command();
 
 program
   .name("edge-ota")
-  .description("Zero-SDK, self-hostable OTA update platform for Expo")
-  .version("0.2.0");
+  .description("Zero-SDK OTA update platform for Expo — by Renbo Studios")
+  .version(packageVersion);
 
-// ──────────────────────────────────────────────────────
-// edge-ota init
-// ──────────────────────────────────────────────────────
+// Show help + auth status when called with no arguments
+program.action(() => {
+  printBanner();
+  const cfg = loadGlobalConfig();
+  if (cfg?.email) {
+    console.log(`  ${c.green}●${c.reset}  Logged in as ${c.bold}${cfg.email}${c.reset}  ${c.dim}(${cfg.serverUrl})${c.reset}`);
+  } else {
+    console.log(`  ${c.dim}○  Not logged in — run ${c.reset}${c.cyan}edge-ota login${c.reset}`);
+  }
+  console.log();
+  console.log(`  ${c.bold}Commands${c.reset}`);
+  const cmds = [
+    ["login",   "Authenticate and save credentials globally"],
+    ["logout",  "Remove stored credentials"],
+    ["init",    "Register project, generate signing keys, configure app.json"],
+    ["push",    "Export bundle and publish an OTA update"],
+    ["status",  "List recent deployments for this project"],
+    ["keygen",  "Generate a new ECDSA key pair (prints to stdout)"],
+  ];
+  for (const [cmd, desc] of cmds) {
+    console.log(`  ${c.cyan}${cmd.padEnd(10)}${c.reset}  ${c.dim}${desc}${c.reset}`);
+  }
+  console.log();
+  console.log(`  Run ${c.cyan}edge-ota <command> --help${c.reset} for command-specific options.`);
+  console.log();
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// edge-ota login
+// ──────────────────────────────────────────────────────────────────────────────
+
 program
-  .command("init")
-  .description(
-    "Generate an ECDSA P-256 key pair and write edge-ota.config.json"
-  )
-  .option(
-    "-s, --server <url>",
-    "EdgeOTA server URL"
-  )
-  .option(
-    "--project <id>",
-    "EdgeOTA Project ID (optional)"
-  )
+  .command("login")
+  .description("Authenticate with your EdgeOTA account")
+  .option("-s, --server <url>", "EdgeOTA server URL", "https://api.edge-ota.renbo.site")
   .action(async (options) => {
     printBanner();
-    let serverUrl = options.server;
-    let projectId = options.project;
 
-    if (!serverUrl) {
-      console.log(`  ${colors.dim}no --server flag provided${colors.reset}`);
-      const answer = await askQuestion(`  server url [https://api.edge-ota.renbo.site]: `);
-      serverUrl = answer.trim() || "https://api.edge-ota.renbo.site";
-    }
+    console.log(`  ${c.bold}Sign in to EdgeOTA${c.reset}\n`);
 
-    if (!projectId && !options.server) {
-      const pAnswer = await askQuestion(`  project id (optional, press Enter to skip): `);
-      if (pAnswer.trim()) projectId = pAnswer.trim();
-    }
+    const serverUrl = options.server.replace(/\/$/, "");
+    const email    = await ask(`  ${c.dim}email:${c.reset}    `);
+    const password = await askSecret(`  ${c.dim}password:${c.reset} `);
 
-    serverUrl = serverUrl.replace(/\/$/, "");
+    spin.start("authenticating");
 
-    console.log(`  ${colors.dim}generating ECDSA P-256 key pair...${colors.reset}`);
-    const keys = await generateECDSAKeyPair();
+    try {
+      const res = await fetch(`${serverUrl}/api/auth/login`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ email, password }),
+      });
 
-    const config: EdgeOTAConfig = { serverUrl, publicKey: keys.publicKey };
-    if (projectId) config.projectId = projectId;
-
-    const cwd = process.cwd();
-    fs.writeFileSync("edge-ota.config.json", JSON.stringify(config, null, 2));
-    fs.writeFileSync(".edge-ota.private.key", keys.privateKey, { mode: 0o600 });
-
-    const gitignorePath = ".gitignore";
-    const gitignoreEntry = ".edge-ota.private.key";
-    if (fs.existsSync(gitignorePath)) {
-      const current = fs.readFileSync(gitignorePath, "utf-8");
-      if (!current.includes(gitignoreEntry)) {
-        fs.appendFileSync(gitignorePath, `\n${gitignoreEntry}\n`);
+      if (!res.ok) {
+        const text = await res.text();
+        spin.fail(`Login failed: ${text || res.statusText}`);
+        process.exit(1);
       }
-    } else {
-      fs.writeFileSync(gitignorePath, `${gitignoreEntry}\n`);
+
+      const data = await res.json() as { token: string; email: string };
+      saveGlobalConfig({ token: data.token, email: data.email, serverUrl });
+
+      spin.stop();
+      const sep = `${c.dim}${"─".repeat(52)}${c.reset}`;
+      console.log(sep);
+      console.log(`  ${c.green}✓${c.reset}  Logged in as ${c.bold}${data.email}${c.reset}`);
+      console.log(`  ${c.dim}credentials saved to ${GLOBAL_CONFIG_FILE}${c.reset}`);
+      console.log(sep + "\n");
+    } catch (e: any) {
+      spin.fail(`Connection failed: ${e.message}`);
+      process.exit(1);
     }
-
-    updateAppJson(cwd, serverUrl, projectId);
-
-    const targetUrlStr = projectId
-      ? `${serverUrl}/api/projects/${projectId}/updates`
-      : `${serverUrl}/api/updates`;
-
-    const sep = `${colors.dim}${"-".repeat(48)}${colors.reset}`;
-    console.log(`\n  ${colors.green}✓${colors.reset}  ${colors.bold}initialised${colors.reset}`);
-    console.log(sep);
-    console.log(`  config   ${colors.cyan}edge-ota.config.json${colors.reset}`);
-    console.log(`  key      ${colors.yellow}.edge-ota.private.key${colors.reset}  ${colors.dim}(keep secret)${colors.reset}`);
-    console.log(`  endpoint ${colors.dim}${targetUrlStr}${colors.reset}`);
-    console.log(sep);
-    console.log(`\n  ${colors.bold}public key${colors.reset}  ${colors.dim}paste into dashboard → Settings → General${colors.reset}\n`);
-    console.log(`${colors.dim}${keys.publicKey}${colors.reset}\n`);
   });
 
-// ──────────────────────────────────────────────────────
-// edge-ota push
-// ──────────────────────────────────────────────────────
-program
-  .command("push")
-  .description(
-    "Export the Expo bundle, compute per-asset hashes, sign & upload to the EdgeOTA server"
-  )
-  .option("-c, --channel <channel>", "Deployment channel", "production")
-  .option("-r, --runtime <version>", "React Native runtime version (semver)", "1.0.0")
-  .option(
-    "-p, --platform <platform>",
-    "Target platform: ios | android | all",
-    "all"
-  )
-  .option("--project <id>", "Project ID (optional, overrides config)")
-  .option("-t, --token <token>", "Deploy key token (or set EDGE_OTA_TOKEN env var)")
-  .option("--skip-export", "Skip expo export (use existing ./dist directory)")
-  .option("--dry-run", "Build and sign the payload but do NOT upload")
-  .action(async (options) => {
-    const cwd = process.cwd();
-    const config     = loadConfig(cwd);
-    const privateKey = loadPrivateKey(cwd);
+// ──────────────────────────────────────────────────────────────────────────────
+// edge-ota logout
+// ──────────────────────────────────────────────────────────────────────────────
 
-    // Resolve token — CLI flag > env var
-    const token = options.token || process.env.EDGE_OTA_TOKEN;
+program
+  .command("logout")
+  .description("Remove stored credentials")
+  .action(() => {
+    printBanner();
+    const cfg = loadGlobalConfig();
+    clearGlobalConfig();
+    if (cfg?.email) {
+      console.log(`  ${c.green}✓${c.reset}  Logged out from ${c.bold}${cfg.email}${c.reset}\n`);
+    } else {
+      console.log(`  ${c.dim}Already logged out.${c.reset}\n`);
+    }
+  });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// edge-ota init
+// ──────────────────────────────────────────────────────────────────────────────
+
+program
+  .command("init")
+  .description("Register project on EdgeOTA, generate signing keys, configure app.json")
+  .option("-s, --server <url>", "EdgeOTA server URL (overrides logged-in server)")
+  .action(async (options) => {
+    printBanner();
+
+    const token = resolveToken();
     if (!token) {
-      console.error(`${colors.bold}${colors.red}❌  Auth token required. Use --token <token> or set EDGE_OTA_TOKEN env var.${colors.reset}`);
-      console.error(`   Generate a deploy key from your dashboard → Keys page.`);
+      console.error(`  ${c.red}✗${c.reset}  Not logged in. Run ${c.cyan}edge-ota login${c.reset} first.\n`);
       process.exit(1);
     }
 
-    // Resolve project ID — CLI flag > config file
-    const projectId = options.project || config.projectId;
+    const globalCfg = loadGlobalConfig();
+    const serverUrl = (options.server || globalCfg?.serverUrl || "https://api.edge-ota.renbo.site").replace(/\/$/, "");
+    const cwd       = process.cwd();
 
-    // Build the correct upload URL
-    const uploadUrl = projectId
-      ? `${config.serverUrl}/api/projects/${projectId}/updates`
-      : `${config.serverUrl}/api/updates`;
+    // Fetch existing projects
+    spin.start("fetching existing projects from server");
+    let projects: any[] = [];
+    try {
+      const res = await fetch(`${serverUrl}/api/projects`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        projects = await res.json() as any[];
+      }
+      spin.stop();
+    } catch (e: any) {
+      spin.fail(`Failed to fetch projects: ${e.message}`);
+      // Continue with creation if list fails
+    }
 
-    // ── Step 1: Build ────────────────────────────────────────────────────────
-    printBanner();
-    const distDir = path.resolve(cwd, "dist");
+    let projectId: string | null = null;
+    let projectName = "";
 
-    if (!options.skipExport) {
-      console.log(`  ${colors.dim}running expo export...${colors.reset}`);
+    if (projects.length > 0) {
+      const options = projects.map(p => ({
+        label: `${p.name} ${c.dim}(id: ${p.id.slice(0, 8)}...)${c.reset}`,
+        value: p
+      }));
+      options.push({
+        label: `${c.green}Create a new project...${c.reset}`,
+        value: null
+      });
+
+      const selected = await selectOption(
+        "Select a project to associate with this app:",
+        options
+      );
+
+      if (selected) {
+        projectId = selected.id;
+        projectName = selected.name;
+      }
+    }
+
+    const keys = await generateECDSAKeyPair();
+
+    if (projectId) {
+      // Re-initialize existing project: update public key on the server
+      spin.start(`associating project "${projectName}"`);
       try {
-        execSync("npx expo export", { stdio: "inherit", cwd });
-      } catch {
-        console.error(`  ${colors.red}error${colors.reset}  expo export failed`);
+        const res = await fetch(`${serverUrl}/api/projects/${projectId}`, {
+          method:  "PUT",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body:    JSON.stringify({ name: projectName, publicKey: keys.publicKey }),
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          spin.fail(`Failed to update project public key on server: ${text}`);
+          process.exit(1);
+        }
+        spin.stop(`associated project "${projectName}"`);
+      } catch (e: any) {
+        spin.fail(`Connection error: ${e.message}`);
         process.exit(1);
       }
     } else {
-      console.log(`  ${colors.dim}skipping expo export (--skip-export)${colors.reset}`);
+      // Create new project
+      let suggestedName = path.basename(cwd);
+      try {
+        const data = JSON.parse(fs.readFileSync(path.resolve(cwd, "app.json"), "utf-8"));
+        suggestedName = data?.expo?.name || suggestedName;
+      } catch { /* ignore */ }
+
+      projectName = (await ask(`  ${c.dim}project name [${suggestedName}]:${c.reset} `)) || suggestedName;
+
+      spin.start("registering project on server");
+      try {
+        const res = await fetch(`${serverUrl}/api/projects`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body:    JSON.stringify({ name: projectName, publicKey: keys.publicKey }),
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          spin.fail(`Failed to register project: ${text}`);
+          process.exit(1);
+        }
+
+        const data = await res.json() as { id: string };
+        projectId = data.id;
+        spin.stop("project registered");
+      } catch (e: any) {
+        spin.fail(`Connection error: ${e.message}`);
+        process.exit(1);
+      }
     }
 
-    if (!fs.existsSync(distDir)) {
-      console.error(`  ${colors.red}error${colors.reset}  ./dist not found after export`);
+    // Save private key globally
+    if (projectId) {
+      savePrivateKey(projectId, keys.privateKey);
+      // Update app.json
+      updateAppJson(cwd, serverUrl, projectId, keys.publicKey);
+
+      const sep = `${c.dim}${"─".repeat(52)}${c.reset}`;
+      console.log(`\n${sep}`);
+      console.log(`  ${c.green}✓${c.reset}  ${c.bold}Initialised${c.reset}`);
+      console.log(sep);
+      console.log(`  project    ${c.dim}${projectId}${c.reset}`);
+      console.log(`  server     ${c.dim}${serverUrl}${c.reset}`);
+      console.log(`  key file   ${c.dim}${path.join(GLOBAL_KEYS_DIR, `${projectId}.key`)}${c.reset}`);
+      console.log(sep + "\n");
+      console.log(`  ${c.dim}Next step:${c.reset} run ${c.cyan}edge-ota push${c.reset} to publish your first update.\n`);
+    }
+  });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// edge-ota push
+// ──────────────────────────────────────────────────────────────────────────────
+
+program
+  .command("push")
+  .description("Export your Expo bundle and publish an OTA update")
+  .option("-c, --channel <channel>",  "Deployment channel",                       "production")
+  .option("-p, --platform <platform>","Target platform: ios | android | all",     "all")
+  .option("--skip-export",            "Skip expo export (use existing ./dist directory)")
+  .option("--dry-run",                "Build and sign the payload but do NOT upload")
+  .action(async (options) => {
+    const cwd   = process.cwd();
+    const token = resolveToken();
+
+    printBanner();
+
+    if (!token) {
+      console.error(`  ${c.red}✗${c.reset}  Not logged in. Run ${c.cyan}edge-ota login${c.reset} first.`);
+      console.error(`     Or set ${c.dim}EDGE_OTA_TOKEN${c.reset} environment variable.\n`);
       process.exit(1);
     }
 
-    console.log(`  ${colors.dim}collecting assets...${colors.reset}`);
+    // Auto-detect from app.json
+    const appCfg = readAppJson(cwd);
+    const { serverUrl, projectId, runtimeVersion } = appCfg;
+
+    // Load private signing key
+    const privateKey = projectId ? loadPrivateKey(projectId) : null;
+    if (!privateKey) {
+      console.error(`  ${c.red}✗${c.reset}  No signing key found for this project.`);
+      if (projectId) {
+        console.error(`     Expected at: ${c.dim}${path.join(GLOBAL_KEYS_DIR, `${projectId}.key`)}${c.reset}`);
+      }
+      console.error(`     Run ${c.cyan}edge-ota init${c.reset} to set up code signing.\n`);
+      process.exit(1);
+    }
+
+    const uploadUrl = projectId
+      ? `${serverUrl}/api/projects/${projectId}/updates`
+      : `${serverUrl}/api/updates`;
+
+    const distDir = path.resolve(cwd, "dist");
+
+    // ── Step 1: Expo export ──────────────────────────────────────────────────
+    if (!options.skipExport) {
+      spin.start("running expo export");
+
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn("npx", ["expo", "export"], {
+          cwd,
+          stdio: ["inherit", "pipe", "pipe"],
+          shell: process.platform === "win32",
+        });
+
+        // Filter stdout: only show platform bundle lines
+        proc.stdout?.on("data", (chunk: Buffer) => {
+          const text = chunk.toString();
+          for (const line of text.split("\n")) {
+            const t = line.trim();
+            // Show platform bundle summary lines only
+            if (t.startsWith("_expo/static/js/") || t.match(/\.(hbc|js)\s+\(\d/)) {
+              spin.stop();
+              console.log(`  ${c.dim}${t}${c.reset}`);
+              spin.start("running expo export");
+            }
+            // Update spinner with bundling progress
+            if (t.match(/Bundled \d+ms/)) {
+              spin.update("expo export — " + t.replace("Bundled", "").trim());
+            }
+          }
+        });
+
+        // Suppress stderr noise but capture real errors
+        let stderrBuf = "";
+        proc.stderr?.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString(); });
+
+        proc.on("close", code => {
+          if (code === 0) {
+            spin.stop("expo export complete");
+            resolve();
+          } else {
+            spin.fail("expo export failed");
+            // Print last few lines of stderr for context
+            const lines = stderrBuf.split("\n").filter(Boolean);
+            for (const l of lines.slice(-10)) console.error(`  ${c.dim}${l}${c.reset}`);
+            reject(new Error(`expo export exited with code ${code}`));
+          }
+        });
+      }).catch(() => process.exit(1));
+
+    } else {
+      console.log(`  ${c.dim}skip-export — using existing ./dist${c.reset}`);
+    }
+
+    if (!fs.existsSync(distDir)) {
+      console.error(`  ${c.red}✗${c.reset}  ./dist not found after export\n`);
+      process.exit(1);
+    }
+
+    // ── Step 2: Collect assets ───────────────────────────────────────────────
+    spin.start("collecting assets");
     const assets = await collectAssets(distDir);
-    console.log(`  ${colors.dim}found ${assets.length} asset(s)${projectId ? ` · project ${projectId}` : ""}${colors.reset}`);
+    spin.stop(`found ${assets.length} asset(s)`);
 
     const platforms = options.platform === "all" ? ["ios", "android"] : [options.platform];
-    const sep = `${colors.dim}${"-".repeat(48)}${colors.reset}`;
+    const sep = `${c.dim}${"─".repeat(52)}${c.reset}`;
 
+    // ── Step 3: Per-platform upload ──────────────────────────────────────────
     for (const platform of platforms) {
       console.log(`\n${sep}`);
-      console.log(`  ${colors.bold}${platform}${colors.reset}`);
+      console.log(`  ${c.bold}${platform}${c.reset}`);
       console.log(sep);
 
       const bundlePath = findBundle(distDir, platform);
       if (!bundlePath) {
-        console.warn(`  ${colors.yellow}warn${colors.reset}  no bundle found for ${platform}, skipping`);
+        console.warn(`  ${c.yellow}⚠${c.reset}   no bundle found for ${platform}, skipping`);
         continue;
       }
 
       const bundleHash = await hashFile(bundlePath);
+      const bundleSize = (fs.statSync(bundlePath).size / 1024 / 1024).toFixed(2);
+      console.log(`  bundle     ${c.dim}${bundleHash.slice(0, 16)}…  ${bundleSize} MB${c.reset}`);
 
       const payloadObj = {
         channel:        options.channel,
-        runtimeVersion: options.runtime,
+        runtimeVersion,
         platform,
         bundleHash,
         timestamp:      Date.now(),
         assetCount:     assets.length,
-        publicKey:      config.publicKey
+        publicKey:      appCfg.publicKey,
       };
       const payloadStr = JSON.stringify(payloadObj);
 
-      console.log(`  signing    ECDSA P-256`);
+      spin.start("signing");
       const signature = await signPayload(payloadStr, privateKey);
-      console.log(`  sig        ${colors.dim}${signature.slice(0, 24)}…${colors.reset}`);
+      spin.stop(`signed  ${c.dim}${signature.slice(0, 20)}…${c.reset}`);
 
       if (options.dryRun) {
-        console.log(`  ${colors.yellow}dry-run${colors.reset}   upload skipped`);
-        console.log("  payload   ", payloadObj);
+        console.log(`  ${c.yellow}dry-run${c.reset}   upload skipped`);
         continue;
       }
 
-      console.log(`  packing    bundle`);
+      spin.start("uploading");
       const bundleBuffer = fs.readFileSync(bundlePath);
       const form = new FormData();
       form.append("bundle",    new Blob([bundleBuffer], { type: "application/javascript" }), `bundle-${platform}.hbc`);
@@ -450,99 +866,110 @@ program
       form.append("signature", signature);
       form.append("platform",  platform);
 
-      console.log(`  uploading  ${colors.dim}${uploadUrl}${colors.reset}`);
       const response = await fetch(uploadUrl, {
         method:  "POST",
         headers: {
-          "Authorization": `Bearer ${token}`,
+          Authorization: `Bearer ${token}`,
           ...(projectId ? { "X-Project-Id": projectId } : {})
         },
-        body: form
+        body: form,
+      }).catch(e => {
+        spin.fail(`Upload failed: ${e.message}`);
+        process.exit(1);
       });
 
-      if (response.ok) {
-        const body = await response.json().catch(() => ({})) as any;
-        const updateId = body.updateId || "unknown";
-        console.log(`  ${colors.green}✓${colors.reset}  deployed`);
-        console.log(`  id         ${colors.dim}${updateId}${colors.reset}`);
-        console.log(`  channel    ${options.channel}`);
-        console.log(`  runtime    ${options.runtime}`);
-        console.log(`  bundle     ${colors.dim}${bundleHash.slice(0, 16)}…${colors.reset}`);
-      } else {
+      if (!response.ok) {
         const text = await response.text();
-        console.error(`  ${colors.red}error${colors.reset}  upload failed (HTTP ${response.status}): ${text}`);
+        spin.fail(`Upload failed (HTTP ${response.status}): ${text}`);
         process.exit(1);
       }
+
+      const body = await response.json().catch(() => ({})) as any;
+      spin.stop("uploaded");
+
+      console.log(`  ${c.green}✓${c.reset}  deployed`);
+      console.log(`  id         ${c.dim}${body.updateId || "—"}${c.reset}`);
+      console.log(`  channel    ${options.channel}`);
+      console.log(`  runtime    ${runtimeVersion}`);
     }
 
-    console.log(`\n${colors.dim}${"-".repeat(48)}${colors.reset}`);
-    console.log(`  ${colors.green}✓${colors.reset}  ${colors.bold}done${colors.reset}  update will be applied on next OTA sync`);
-    console.log(`${colors.dim}${"-".repeat(48)}${colors.reset}\n`);
+    console.log(`\n${sep}`);
+    console.log(`  ${c.green}✓${c.reset}  ${c.bold}done${c.reset}  ${c.dim}update will be applied on next OTA sync${c.reset}`);
+    console.log(`${sep}\n`);
   });
 
-// ──────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // edge-ota status
-// ──────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+
 program
   .command("status")
-  .description("List recent releases from the EdgeOTA server")
-  .option("-t, --token <token>", "Auth token (or set EDGE_OTA_TOKEN env var)")
+  .description("List recent deployments for this project")
   .option("-n, --limit <n>", "Number of releases to show", "10")
-  .option("--project <id>", "Project ID (optional)")
   .action(async (options) => {
-    const cwd    = process.cwd();
-    const config = loadConfig(cwd);
-    const token  = options.token || process.env.EDGE_OTA_TOKEN;
-    const projectId = options.project || config.projectId;
+    printBanner();
 
+    const token = resolveToken();
     if (!token) {
-      console.error(`  ${colors.red}error${colors.reset}  token required — set EDGE_OTA_TOKEN in .env or use -t`);
+      console.error(`  ${c.red}✗${c.reset}  Not logged in. Run ${c.cyan}edge-ota login${c.reset} first.\n`);
       process.exit(1);
     }
+
+    const cwd    = process.cwd();
+    const appCfg = readAppJson(cwd);
+    const { serverUrl, projectId } = appCfg;
 
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     if (projectId) headers["x-project-id"] = projectId;
 
-    const res = await fetch(`${config.serverUrl}/api/releases`, { headers });
+    spin.start("fetching releases");
+
+    const res = await fetch(`${serverUrl}/api/releases`, { headers }).catch(e => {
+      spin.fail(`Connection failed: ${e.message}`);
+      process.exit(1);
+    });
 
     if (!res.ok) {
-      console.error(`  ${colors.red}error${colors.reset}  failed to fetch releases (HTTP ${res.status})`);
+      spin.fail(`Failed to fetch releases (HTTP ${res.status})`);
       process.exit(1);
     }
 
-    const releases = (await res.json()) as any[];
+    const releases = await res.json() as any[];
+    spin.stop();
+
     if (!releases.length) {
-      console.log(`  ${colors.dim}no releases found${colors.reset}`);
+      console.log(`  ${c.dim}No releases found.${c.reset}\n`);
       return;
     }
 
-    const rows = releases.slice(0, parseInt(options.limit)).map((r: any) => ({
-      ID:        r.id.slice(0, 8),
-      Channel:   r.channel,
-      Runtime:   r.runtime,
-      Status:    r.status,
-      Published: r.published,
-      By:        r.publisher
+    const limit = parseInt(options.limit);
+    const rows = releases.slice(0, limit).map((r: any) => ({
+      ID:        r.id?.slice(0, 8) ?? "—",
+      Channel:   r.channel ?? "—",
+      Runtime:   r.runtime ?? "—",
+      Platform:  r.platform ?? "all",
+      Created:   r.created_at ? new Date(r.created_at).toLocaleString() : "—",
     }));
 
     console.table(rows);
   });
 
-// ──────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // edge-ota keygen
-// ──────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+
 program
   .command("keygen")
-  .description("Generate a fresh ECDSA key pair (prints to stdout, does not write files)")
+  .description("Generate a fresh ECDSA P-256 key pair (prints to stdout, does not write files)")
   .action(async () => {
     const keys = await generateECDSAKeyPair();
-    const sep = `${colors.dim}${"-".repeat(48)}${colors.reset}`;
+    const sep  = `${c.dim}${"─".repeat(52)}${c.reset}`;
     console.log(`\n${sep}`);
-    console.log(`  ${colors.bold}private key${colors.reset}  ${colors.dim}keep secret — never commit${colors.reset}`);
+    console.log(`  ${c.bold}private key${c.reset}  ${c.dim}keep secret — never commit${c.reset}`);
     console.log(sep);
     console.log(keys.privateKey);
     console.log(`\n${sep}`);
-    console.log(`  ${colors.bold}public key${colors.reset}   ${colors.dim}paste into dashboard → Settings → General${colors.reset}`);
+    console.log(`  ${c.bold}public key${c.reset}   ${c.dim}paste into dashboard → Settings → General${c.reset}`);
     console.log(sep);
     console.log(keys.publicKey);
   });
