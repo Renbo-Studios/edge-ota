@@ -161,7 +161,7 @@ const spin = (() => {
 
 // ─── Package version ─────────────────────────────────────────────────────────
 
-let packageVersion = "0.2.9";
+let packageVersion = "0.3.0";
 try {
   const pkgPath = path.join(__dirname, "..", "package.json");
   if (fs.existsSync(pkgPath)) {
@@ -181,6 +181,8 @@ function printBanner() {
 }
 
 // ─── app.json helpers ────────────────────────────────────────────────────────
+
+const DEFAULT_SERVER = "https://api.ota.renbo.site";
 
 interface AppJsonConfig {
   serverUrl:      string;
@@ -223,7 +225,7 @@ function readAppJson(cwd: string): AppJsonConfig {
     process.exit(1);
   }
 
-  // Parse serverUrl and projectId from the updates URL
+  // Parse serverUrl and projectId from the updates URL.
   // Expected format: https://<host>/api/projects/<uuid>/updates
   //              or: https://<host>/api/updates
   let serverUrl: string;
@@ -243,7 +245,15 @@ function readAppJson(cwd: string): AppJsonConfig {
     process.exit(1);
   }
 
-  return { serverUrl, projectId, runtimeVersion, publicKey: expo.updates?.publicKey };
+  // ── Project-level server override ──
+  // expo.extra.edgeOtaServer lets users point a specific project at a
+  // different (self-hosted) EdgeOTA instance without re-logging in.
+  const projectServer: string | undefined = expo?.extra?.edgeOtaServer;
+  if (projectServer) {
+    serverUrl = projectServer.replace(/\/$/, "");
+  }
+
+  return { serverUrl, projectId, runtimeVersion, publicKey: expo?.extra?.edgeOtaPublicKey };
 }
 
 function updateAppJson(cwd: string, serverUrl: string, projectId?: string, publicKey?: string) {
@@ -254,6 +264,7 @@ function updateAppJson(cwd: string, serverUrl: string, projectId?: string, publi
     const data = JSON.parse(fs.readFileSync(appJsonPath, "utf-8"));
     if (!data.expo) data.expo = {};
     if (!data.expo.updates) data.expo.updates = {};
+    if (!data.expo.extra) data.expo.extra = {};
 
     const cleanUrl = serverUrl.replace(/\/$/, "");
     data.expo.updates.url = projectId
@@ -263,14 +274,17 @@ function updateAppJson(cwd: string, serverUrl: string, projectId?: string, publi
     data.expo.updates.fallbackToCacheTimeout = data.expo.updates.fallbackToCacheTimeout ?? 30000;
     data.expo.updates.requestHeaders = data.expo.updates.requestHeaders ?? { "expo-channel-name": "production" };
 
+    // Store the server URL in expo.extra.edgeOtaServer so users can easily
+    // override which EdgeOTA instance this project points to without re-running
+    // `edge-ota login`. They can edit this value directly in app.json.
+    data.expo.extra.edgeOtaServer = cleanUrl;
+
     if (publicKey) {
-      data.expo.updates.codeSigningCertificate = undefined; // clear legacy
-      data.expo.extra = data.expo.extra ?? {};
       data.expo.extra.edgeOtaPublicKey = publicKey;
     }
 
     fs.writeFileSync(appJsonPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
-    console.log(`  ${c.dim}app.json${c.reset}    updated ${c.dim}expo.updates.url${c.reset}`);
+    console.log(`  ${c.dim}app.json${c.reset}    updated ${c.dim}expo.updates.url${c.reset} + ${c.dim}expo.extra.edgeOtaServer${c.reset}`);
   } catch (e: any) {
     console.error(`  ${c.yellow}⚠${c.reset}   Could not update app.json: ${e.message}`);
   }
@@ -522,13 +536,18 @@ program.action(() => {
 program
   .command("login")
   .description("Authenticate with your EdgeOTA account")
-  .option("-s, --server <url>", "EdgeOTA server URL", "https://api.edge-ota.renbo.site")
+  .option("-s, --server <url>", `EdgeOTA server URL (default: ${DEFAULT_SERVER})`)
   .action(async (options) => {
     printBanner();
 
-    console.log(`  ${c.bold}Sign in to EdgeOTA${c.reset}\n`);
+    const usingCustomServer = options.server && options.server !== DEFAULT_SERVER;
+    console.log(`  ${c.bold}Sign in to EdgeOTA${c.reset}`);
+    if (usingCustomServer) {
+      console.log(`  ${c.dim}server: ${options.server}${c.reset}`);
+    }
+    console.log();
 
-    const serverUrl = options.server.replace(/\/$/, "");
+    const serverUrl = (options.server || DEFAULT_SERVER).replace(/\/$/, "");
     const email    = await ask(`  ${c.dim}email:${c.reset}    `);
     const password = await askSecret(`  ${c.dim}password:${c.reset} `);
 
@@ -598,7 +617,7 @@ program
     }
 
     const globalCfg = loadGlobalConfig();
-    const serverUrl = (options.server || globalCfg?.serverUrl || "https://api.edge-ota.renbo.site").replace(/\/$/, "");
+    const serverUrl = (options.server || globalCfg?.serverUrl || DEFAULT_SERVER).replace(/\/$/, "");
     const cwd       = process.cwd();
 
     // Fetch existing projects
