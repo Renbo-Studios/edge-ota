@@ -27,14 +27,14 @@
 
 ```
  ╔══════════════════════════════════════════════════════════════════╗
- ║                                                                ║
- ║   ┌─┐┬┌─┬┌┬┐┌─┐┌─┐┬ ┬┌─┐┌┐┌┌┬┐┌─┐                          ║
- ║   └─┐││ ┤│││├┤ │ ┬├─┤├─┤│││ │ ┤ └─┐                         ║
- ║   └─┘┴└─┴┴ ┴└  └─┘┴ ┴┴ ┴┘└┘─┴┘└─┘└─┘                         ║
- ║                                                                ║
- ║   Push signed OTA bundles to the edge.                         ║
- ║   Zero SDK. Zero egress. Full control.                         ║
- ║                                                                ║
+ ║                                                                  ║
+ ║   ┌─┐┬┌─┬┌┬┐┌─┐┌─┐┬ ┬┌─┐┌┐┌┌┬┐┌─┐                                ║
+ ║   └─┐││ ┤│││├┤ │ ┬├─┤├─┤│││ │ ┤ └─┐                              ║
+ ║   └─┘┴└─┴┴ ┴└  └─┘┴ ┴┴ ┴┘└┘─┴┘└─┘└─┘                             ║
+ ║                                                                  ║
+ ║   Push signed OTA bundles to the edge.                           ║
+ ║   Zero SDK. Zero egress. Full control.                           ║
+ ║                                                                  ║
  ╚══════════════════════════════════════════════════════════════════╝
 ```
 
@@ -102,9 +102,9 @@ edge-ota push
 > **📹 Prefer video?** Watch the full setup tutorial below:
 
 <p align="center">
-  <video src="https://pd1mvpk7lt.ufs.sh/f/6uDGWrRxa3ipmhByNjc2TlHph0oA4dsWRFUuqZMan18Gwb7g" controls width="100%" style="max-width: 640px; border: 1px solid #333; border-radius: 4px; background: #000;">
-    Your browser does not support the video tag.
-  </video>
+<a href="https://pd1mvpk7lt.ufs.sh/f/6uDGWrRxa3ipmhByNjc2TlHph0oA4dsWRFUuqZMan18Gwb7g">
+  <img src="path/to/preview-thumbnail.gif" width="640">
+</a>
 </p>
 
 <br>
